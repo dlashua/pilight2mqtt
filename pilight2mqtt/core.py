@@ -17,6 +17,7 @@ import logging
 import paho.mqtt.client as mqtt
 
 from pilight2mqtt.discover import discover
+from time import sleep
 
 __all__ = ['Pilight2MQTT', 'PilightServer']
 
@@ -73,8 +74,10 @@ class PilightServer(Loggable):
         self._socket = None
         self._should_terminate = True
         self._event_handler = None
+        self._lines_generator = None
 
     def _readlines(self):
+        self.log.debug('_readlines is starting')
         buffer = b''
         while not self._should_terminate:
             try:
@@ -87,12 +90,18 @@ class PilightServer(Loggable):
                     yield line
             except socket.timeout:
                 pass
+            except socket.error:
+                self.reconnect()
 
     def _read(self):
         """read data from socket"""
-        self.log.debug('read')
-        lines_generator = self._readlines()
-        text = next(lines_generator)
+        self.log.debug('_read')
+        if(self._lines_generator == None):
+            self._lines_generator = self._readlines()
+        try:
+            text = next(self._lines_generator)
+        except StopIteration as e:
+            text = ""
         self.log.debug('_read received %s', text)
         return text
 
@@ -143,15 +152,30 @@ class PilightServer(Loggable):
             'uuid': '0000-d0-63-00-000000',
             'media': 'all'
         })
+        if(suc):
+            assert self.heartbeat()
+            self.update_all_devices()
         return suc
 
+    def update_all_devices(self):
+        self.log.info("Updating all devices")
+
+        self.send_json({
+            "action": "request values"
+        })
+
+        return True
 
     def reconnect(self):
         """try to reconnect if the connection got lost"""
+        self.log.info("Disconnected from PiLight.")
         try:
             connected = False
             while not self._should_terminate and not connected:
+                self.log.info("Attempting to reconnect to PiLight.")
                 connected = self.connect()
+            if(connected):
+                self.log.info("Reconnected to PiLight.")
             return connected
         except Exception:  # pylint: disable=broad-except
             pass
@@ -246,10 +270,11 @@ class Pilight2MQTT(Loggable):
         if match:
             device = match.group(1)
             state = msg.payload
+            self.log.info('MQTT Command Requested PiLight change on "' + device + '" to state "' + state.decode('utf-8') + '"')
             self._server.set_device_state(device, state.decode('utf-8'))
 
     def _send_mqtt_msg(self, device, topic, payload):
-        self.log.info('Update for device "%s" on topic "%s", new value "%s"', device, topic, payload)  # flake8: NOQA pylint: disable=line-too-long
+        self.log.info('Updating MQTT for PiLight state change "%s" on topic "%s", new value "%s"', device, topic, payload)  # flake8: NOQA pylint: disable=line-too-long
         (result, mid) = self._mqtt_client.publish(topic,
                                                   payload=payload,
                                                   qos=0,
@@ -260,14 +285,7 @@ class Pilight2MQTT(Loggable):
     def _mktopic(self, device, reading):
         return '%s/status/%s/%s' % (self._mqtt_topic, device, reading)
 
-    def update_all_devices(self):
-        self.log.debug("Updating all devices")
 
-        self._server.send_json({
-            "action": "request values"
-        })
-
-        return True
 
     def _handle_event(self, evt):
         """event handling for message from pilight"""
@@ -307,8 +325,7 @@ class Pilight2MQTT(Loggable):
         def stop_server(signum, frame):  # pylint: disable=missing-docstring
             self.log.debug("SIGINT")
             self._server.terminate()
-            self._mqtt_client.loop_stop()
-            self._mqtt_client.disconnect()
+
         signal.signal(signal.SIGINT, stop_server)
 
         self.log.info('MQTT Connect %s:%d',
@@ -318,20 +335,18 @@ class Pilight2MQTT(Loggable):
         except Exception as ex:  # pylint: disable=broad-except
             self.log.error('Failed to connect to MQTT server: %s', str(ex))
             return 1
-        self._mqtt_client.loop_start()
+
 
         suc = self._server.connect()
         if not suc:
             self.log.error('Could not connect to server')
             return 1
 
-        assert self._server.heartbeat()
-
-        self.update_all_devices()
-
-
         def callback(event):  # pylint: disable=missing-docstring
             self._handle_event(event)
+
+        self.log.info('Starting constant MQTT loop')
+        self._mqtt_client.loop_start()
 
         self._server.process_events(callback)
         self._server.disconnect()
