@@ -62,6 +62,9 @@ class PilightServer(Loggable):
         log.info('Found server at %s:%d', location, int(port))
         return PilightServer(location, int(port))
 
+    def copy(self):
+        return PilightServer(self._address, self._port)
+
     def __init__(self, address, port):
         """initialize"""
         self.log.debug('__init__(%s, %s)', address, port)
@@ -83,7 +86,7 @@ class PilightServer(Loggable):
                     self.log.debug('_readlines yield line %s', line)
                     yield line
             except socket.timeout:
-                continue
+                pass
 
     def _read(self):
         """read data from socket"""
@@ -96,7 +99,8 @@ class PilightServer(Loggable):
     def send_check_success(self, msg_dct):
         """send message and check that it was successfull"""
         self.log.debug('_send_check_success')
-        response = self.send_json(msg_dct)
+        self.send_json(msg_dct)
+        response = json.loads(self._read().decode('utf-8'))
         if response.get('status', '') == 'success':
             return True
         return False
@@ -105,17 +109,12 @@ class PilightServer(Loggable):
         """send json data and read response, which is also json"""
         self.log.debug('_send_json')
         msg = bytes(json.dumps(msg_dct)+'\n', 'utf-8')
-        response = self.send_raw(msg)
-        if self._should_terminate:
-            return {}
-        return json.loads(response.decode("utf-8"))
+        self.send_raw(msg)
 
     def send_raw(self, msg):
         """send and read raw data"""
         self.log.debug('_send_raw')
         self._socket.send(msg)
-        response = self._read()
-        return response
 
     def _open_socket(self):
         """open a socket to pilight"""
@@ -145,6 +144,7 @@ class PilightServer(Loggable):
             'media': 'all'
         })
         return suc
+
 
     def reconnect(self):
         """try to reconnect if the connection got lost"""
@@ -181,7 +181,8 @@ class PilightServer(Loggable):
 
     def heartbeat(self):
         """send and read heart beat to/from pilight"""
-        response = self.send_raw(b'HEART')
+        self.send_raw(b'HEART')
+        response = self._read()
         if response == b'BEAT':
             return True
         return False
@@ -196,7 +197,7 @@ class PilightServer(Loggable):
                 'state': state
             }
         }
-        return self.send_check_success(msg)
+        self.send_json(msg)
 
 
 class Pilight2MQTT(Loggable):
@@ -219,9 +220,16 @@ class Pilight2MQTT(Loggable):
             # pylint: disable=missing-docstring
             return self._on_message(client, userdata, msg)
 
+        def on_disconnect(client, userdata, rc):
+            if(rc != 0):
+                self.log.info("MQTT Server Disconnect")
+            return True
+
+
         self._mqtt_client = mqtt.Client()
         self._mqtt_client.on_connect = on_connect
         self._mqtt_client.on_message = on_message
+        self._mqtt_client.on_disconnect = on_disconnect
 
     def _on_connect(self, client, userdata, flags, result_code):
         """execute setup of mqtt, i.e. subscribe to a channel"""
@@ -241,7 +249,7 @@ class Pilight2MQTT(Loggable):
             self._server.set_device_state(device, state.decode('utf-8'))
 
     def _send_mqtt_msg(self, device, topic, payload):
-        self.log.info('Update for device "%s" on topic "%s", new value "%s"', device, payload, topic)  # flake8: NOQA pylint: disable=line-too-long
+        self.log.info('Update for device "%s" on topic "%s", new value "%s"', device, topic, payload)  # flake8: NOQA pylint: disable=line-too-long
         (result, mid) = self._mqtt_client.publish(topic,
                                                   payload=payload,
                                                   qos=0,
@@ -252,30 +260,45 @@ class Pilight2MQTT(Loggable):
     def _mktopic(self, device, reading):
         return '%s/status/%s/%s' % (self._mqtt_topic, device, reading)
 
+    def update_all_devices(self):
+        self.log.debug("Updating all devices")
+
+        self._server.send_json({
+            "action": "request values"
+        })
+
+        return True
+
     def _handle_event(self, evt):
         """event handling for message from pilight"""
         self.log.debug(evt)
         try:
             evt_dct = json.loads(evt.decode('utf-8'))
             if evt_dct.get('origin', '') == 'update':
-                evt_type = evt_dct.get('type', None)
-                if evt_type == 1: # switch
-                    for device in evt_dct.get('devices', []):
-                        self._send_mqtt_msg(device,
-                                            self._mktopic(device, 'STATE'),
-                                            evt_dct['values']['state'])
-                elif evt_type == 3:
-                    for device in evt_dct.get('devices', []):
-                        self._send_mqtt_msg(device,
-                                            self._mktopic(device, 'HUMIDITY'),
-                                            evt_dct['values']['humidity'])
-                        self._send_mqtt_msg(device,
-                                            self._mktopic(device, 'TEMPERATURE'),
-                                            evt_dct['values']['temperature'])
-                else:
-                    raise RuntimeError('Unsupported event type %d' % evt_type)
+                self._handle_device_update(evt_dct)
+            elif evt_dct.get('message', '') == 'values':
+                for evt_dct_each in evt_dct.get('values', []):
+                    self._handle_device_update(evt_dct_each)
         except Exception as ex:  # pylint: disable=broad-except
             self.log.error('%s: %s', ex.__class__.__name__, ex)
+
+    def _handle_device_update(self, evt_dct):
+        evt_type = evt_dct.get('type', None)
+        if evt_type == 1: # switch
+            for device in evt_dct.get('devices', []):
+                self._send_mqtt_msg(device,
+                                    self._mktopic(device, 'STATE'),
+                                    evt_dct['values']['state'])
+        elif evt_type == 3:
+            for device in evt_dct.get('devices', []):
+                self._send_mqtt_msg(device,
+                                    self._mktopic(device, 'HUMIDITY'),
+                                    evt_dct['values']['humidity'])
+                self._send_mqtt_msg(device,
+                                    self._mktopic(device, 'TEMPERATURE'),
+                                    evt_dct['values']['temperature'])
+        else:
+            raise RuntimeError('Unsupported event type %d' % evt_type)
 
     def run(self):
         """main run method"""
@@ -284,12 +307,14 @@ class Pilight2MQTT(Loggable):
         def stop_server(signum, frame):  # pylint: disable=missing-docstring
             self.log.debug("SIGINT")
             self._server.terminate()
+            self._mqtt_client.loop_stop()
+            self._mqtt_client.disconnect()
         signal.signal(signal.SIGINT, stop_server)
 
         self.log.info('MQTT Connect %s:%d',
                       self._mqtt_host, self._mqtt_port)
         try:
-            self._mqtt_client.connect(self._mqtt_host, self._mqtt_port, 60)
+            self._mqtt_client.connect(self._mqtt_host, self._mqtt_port, 15)
         except Exception as ex:  # pylint: disable=broad-except
             self.log.error('Failed to connect to MQTT server: %s', str(ex))
             return 1
@@ -301,6 +326,9 @@ class Pilight2MQTT(Loggable):
             return 1
 
         assert self._server.heartbeat()
+
+        self.update_all_devices()
+
 
         def callback(event):  # pylint: disable=missing-docstring
             self._handle_event(event)
